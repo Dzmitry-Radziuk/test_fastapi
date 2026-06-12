@@ -1,0 +1,80 @@
+name: Deploy via Docker Hub
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  # Этап 1: Сборка и отправка обоих образов в Docker Hub
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Сборка 1: Главный сервис FastAPI
+      - name: Build and push Main Web Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Сборка 2: Сервис-эмулятор
+      - name: Build and push External Emulator Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.external
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-external-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Этап 2: Деплой на твой сервер в папку test_fastapi
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - name: Deploy via SSH to Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Переходим в целевую папку проекта, где уже лежит .env
+            cd ~/test_fastapi
+            
+            # Если на сервере настроен git, стягиваем свежие конфиги docker-compose
+            if [ -d ".git" ]; then
+              git pull origin main
+            fi
+            
+            # Авторизуемся в Docker Hub на сервере
+            echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+            
+            # Стягиваем новые версии обоих образов
+            docker compose -f docker-compose.prod.yaml pull
+            
+            # Перезапускаем контейнеры в фоне (Zero Downtime)
+            docker compose -f docker-compose.prod.yaml up -d
+            
+            # Безопасный логаут
+            docker logout
+            
+            # Очистка неиспользуемого мусора и старых образов
+            docker image prune -f
